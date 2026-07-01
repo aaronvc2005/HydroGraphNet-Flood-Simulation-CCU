@@ -1,157 +1,255 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+
+import time
+
+import hydra
 import torch
-import torch.optim as optim
 import torch.nn as nn
-import numpy as np
+import torch_geometric as pyg
+import wandb
 
-def train_hydrographnet(
-    model,
-    tensors,
-    pinn_loss_fn,
-    epochs: int = 150,
-    lr: float = 0.005,
-    pushforward_steps: int = 3, # K-steps rollout for stability
-    dt: float = 1.0,
-    device: str = "cpu"
-) -> dict:
-    """
-    Main training function for HydroGraphNet using Physics-Informed losses
-    and the Pushforward Trick for autoregressive stability.
-    """
-    model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
-    
-    # Extract mesh static variables
-    cell_centers = tensors["cell_centers"]
-    cell_elevations = tensors["cell_elevations"]
-    cell_areas = tensors["cell_areas"]
-    face_cells = tensors["face_cells"]
-    face_widths = tensors["face_widths"]
-    face_normals = tensors["face_normals"]
-    
-    # Extract dynamic simulation data
-    depths = tensors["depths"]           # Shape: [time_steps, num_cells]
-    velocities = tensors["velocities"]   # Shape: [time_steps, num_cells, 2]
-    
-    time_steps = depths.size(0)
-    num_cells = depths.size(1)
-    
-    # Build static node features: [elevation, cell_centers_x, cell_centers_y]
-    static_features = torch.cat([
-        cell_elevations.unsqueeze(-1),
-        cell_centers
-    ], dim=-1) # Shape: [num_cells, 3]
-    
-    # Build edge structures
-    edge_index, edge_attr = model.prepare_edges(face_cells, face_widths, face_normals)
-    
-    history_losses = {"total": [], "data": [], "mass": [], "bound": []}
-    
-    print(f"--- Starting HydroGraphNet PINN Training ---")
-    print(f"Number of nodes (cells): {num_cells}")
-    print(f"Number of edges (face connections): {edge_index.size(1)}")
-    print(f"Training for {epochs} epochs using Pushforward Rollout={pushforward_steps} steps...")
-    
-    for epoch in range(1, epochs + 1):
-        model.train()
-        optimizer.zero_grad()
-        
-        epoch_total_loss = 0.0
-        epoch_data_loss = 0.0
-        epoch_mass_loss = 0.0
-        epoch_bound_loss = 0.0
-        
-        # We sample random start times for autoregressive rollouts to cover the timeseries
-        # Ensure we have enough remaining steps to perform rollout
-        max_start_time = time_steps - pushforward_steps - 1
-        
-        # Train over the entire sequence by chunking into rollout segments
-        for start_t in range(0, max_start_time, pushforward_steps):
-            # Get initial state: [h, u, v] at start_t
-            state = torch.cat([
-                depths[start_t].unsqueeze(-1),
-                velocities[start_t]
-            ], dim=-1) # Shape: [num_cells, 3]
-            
-            # Perform rollout
-            accumulated_loss = 0.0
-            
-            for step in range(pushforward_steps):
-                t_curr = start_t + step
-                t_next = t_curr + 1
-                
-                # Combine static node features with current dynamic state
-                node_features = torch.cat([static_features, state], dim=-1)
-                
-                # Forward pass: predict rate of change
-                delta = model(node_features, edge_index, edge_attr)
-                
-                # Compute predicted state at next step
-                h_pred = torch.clamp(state[:, 0:1] + delta[:, 0:1], min=0.0)
-                u_pred = state[:, 1:2] + delta[:, 1:2]
-                v_pred = state[:, 2:3] + delta[:, 2:3]
-                pred_state = torch.cat([h_pred, u_pred, v_pred], dim=-1)
-                
-                # Target ground-truth state at next step
-                true_state = torch.cat([
-                    depths[t_next].unsqueeze(-1),
-                    velocities[t_next]
-                ], dim=-1)
-                
-                # Compute composite loss (data + physics + boundary)
-                total, data, mass, bound = pinn_loss_fn(
-                    pred_state=pred_state,
-                    true_state=true_state,
-                    prev_state=state,
-                    face_cells=face_cells,
-                    face_widths=face_widths,
-                    face_normals=face_normals,
-                    cell_areas=cell_areas,
-                    dt=dt
-                )
-                
-                accumulated_loss += total
-                
-                epoch_data_loss += data.item()
-                epoch_mass_loss += mass.item()
-                epoch_bound_loss += bound.item()
-                
-                # Update current state for the next step of the pushforward trick (autoregressive feedback)
-                # To prevent gradient explosion we detach or keep gradients.
-                # In standard pushforward, we keep gradients to backpropagate through time (BPTT).
-                state = pred_state
-                
-            # Average loss over the rollout length
-            accumulated_loss = accumulated_loss / pushforward_steps
-            accumulated_loss.backward()
-            
-            epoch_total_loss += accumulated_loss.item()
+from hydra.utils import to_absolute_path
+from omegaconf import DictConfig
 
-        # Step optimizer
-        optimizer.step()
-        
-        # Scale losses for logging
-        num_batches = len(range(0, max_start_time, pushforward_steps))
-        avg_total = epoch_total_loss / num_batches
-        avg_data = epoch_data_loss / (num_batches * pushforward_steps)
-        avg_mass = epoch_mass_loss / (num_batches * pushforward_steps)
-        avg_bound = epoch_bound_loss / (num_batches * pushforward_steps)
-        
-        scheduler.step(avg_total)
-        
-        history_losses["total"].append(avg_total)
-        history_losses["data"].append(avg_data)
-        history_losses["mass"].append(avg_mass)
-        history_losses["bound"].append(avg_bound)
-        
-        if epoch == 1 or epoch % 20 == 0 or epoch == epochs:
-            print(
-                f"Epoch {epoch:03d}/{epochs:03d} | "
-                f"Total Loss: {avg_total:.5f} | "
-                f"Data (MSE): {avg_data:.5f} | "
-                f"SWE Mass Res: {avg_mass:.5f} | "
-                f"Bound Hinge: {avg_bound:.5f}"
+from torch_geometric.loader import DataLoader as PyGDataLoader
+
+from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data.distributed import DistributedSampler
+
+from tqdm import tqdm  # ✅ ADDED
+
+from physicsnemo.datapipes.gnn.hydrographnet_dataset import HydroGraphDataset
+from physicsnemo.distributed.manager import DistributedManager
+from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
+from physicsnemo.utils.logging.wandb import initialize_wandb
+from physicsnemo.utils import load_checkpoint, save_checkpoint
+from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
+from utils import compute_physics_loss
+
+
+def collate_fn(batch):
+    if isinstance(batch[0], tuple):
+        graphs, physics_list = zip(*batch)
+        batched_graph = pyg.data.from_data_list(graphs)
+        physics_data = {}
+        for key in physics_list[0].keys():
+            physics_data[key] = torch.tensor(
+                [d[key] for d in physics_list], dtype=torch.float
             )
+        return batched_graph, physics_data
+    else:
+        return pyg.data.from_data_list(batch)
+
+
+class MGNTrainer:
+    def __init__(self, cfg: DictConfig, rank_zero_logger: RankZeroLoggingWrapper):
+        assert DistributedManager.is_initialized()
+        self.dist = DistributedManager()
+        self.amp = cfg.amp
+        self.noise_type = cfg.noise_type
+
+        self.use_physics_loss = cfg.get("use_physics_loss", False)
+        self.delta_t = cfg.get("delta_t", 1200.0)
+        self.physics_loss_weight = cfg.get("physics_loss_weight", 1.0)
+
+        mlp_act = "relu"
+        if cfg.recompute_activation:
+            mlp_act = "silu"
+
+        dataset = HydroGraphDataset(
+            name="hydrograph_dataset",
+            data_dir=cfg.data_dir,
+            prefix="M80",
+            num_samples=500,
+            n_time_steps=cfg.n_time_steps,
+            k=4,
+            noise_type=cfg.noise_type,
+            noise_std=0.01,
+            hydrograph_ids_file="train.txt",
+            split="train",
+            return_physics=self.use_physics_loss,
+        )
+
+        sampler = DistributedSampler(
+            dataset,
+            shuffle=True,
+            drop_last=True,
+            num_replicas=self.dist.world_size,
+            rank=self.dist.rank,
+        )
+
+        self.dataloader = PyGDataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            sampler=sampler,
+            pin_memory=True,
+            num_workers=cfg.num_dataloader_workers,
+            collate_fn=collate_fn,
+        )
+
+        self.model = MeshGraphKAN(
+            cfg.num_input_features,
+            cfg.num_edge_features,
+            cfg.num_output_features,
+            mlp_activation_fn=mlp_act,
+            do_concat_trick=cfg.do_concat_trick,
+            num_processor_checkpoint_segments=cfg.num_processor_checkpoint_segments,
+            recompute_activation=cfg.recompute_activation,
+        ).to(self.dist.device)
+
+        if self.dist.world_size > 1:
+            self.model = DistributedDataParallel(
+                self.model,
+                device_ids=[self.dist.local_rank],
+                output_device=self.dist.device,
+                broadcast_buffers=self.dist.broadcast_buffers,
+                find_unused_parameters=self.dist.find_unused_parameters,
+            )
+
+        self.model.train()
+        self.criterion = nn.MSELoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
+
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, lr_lambda=lambda epoch: cfg.lr_decay_rate**epoch
+        )
+
+        self.scaler = GradScaler()
+
+        self.epoch_init = load_checkpoint(
+            to_absolute_path(cfg.ckpt_path),
+            models=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            device=self.dist.device,
+        )
+
+    def train(self, batch):
+        if self.use_physics_loss:
+            graph, physics_data = batch
+        else:
+            graph = batch
+            physics_data = None
+
+        graph = graph.to(self.dist.device)
+        
+        # >>> ADDED: Strict NaN scrubbing for graph tensors to prevent poisoning from faulty standard deviations
+        graph.x = torch.nan_to_num(graph.x, nan=0.0, posinf=0.0, neginf=0.0)
+        graph.y = torch.nan_to_num(graph.y, nan=0.0, posinf=0.0, neginf=0.0)
+        if hasattr(graph, 'edge_attr') and graph.edge_attr is not None:
+            graph.edge_attr = torch.nan_to_num(graph.edge_attr, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if physics_data is not None:
+            physics_data = {k: v.to(self.dist.device) for k, v in physics_data.items()}
+            # >>> ADDED: Sanitize physics data tensors
+            physics_data = {k: torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0) for k, v in physics_data.items()}
+
+        self.optimizer.zero_grad()
+        loss, loss_dict = self.forward(graph, physics_data)
+        self.backward(loss)
+        self.scheduler.step()
+        return loss, loss_dict
+
+    def forward(self, graph, physics_data):
+        with autocast(device_type=self.dist.device.type, enabled=self.amp):
+            pred = self.model(graph.x, graph.edge_attr, graph)
             
-    print(f"--- Training Finished successfully! ---\n")
-    return history_losses
+            # >>> ADDED: Clamp predictions to prevent FP16 numerical explosions during early unstable epochs
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+            pred = torch.clamp(pred, min=-10.0, max=10.0)
+            
+            mse_loss = self.criterion(pred, graph.y)
+            loss = mse_loss
+            loss_dict = {"total_loss": loss, "mse_loss": mse_loss}
+
+            if self.use_physics_loss and physics_data is not None:
+                phy_loss = compute_physics_loss(
+                    pred, physics_data, graph, delta_t=self.delta_t
+                )
+                loss = loss + self.physics_loss_weight * phy_loss
+                loss_dict["physics_loss"] = phy_loss
+
+        return loss, loss_dict
+
+    def backward(self, loss):
+        if self.amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
+
+
+@hydra.main(version_base="1.3", config_path="conf", config_name="config")
+def main(cfg: DictConfig) -> None:
+    DistributedManager.initialize()
+    dist = DistributedManager()
+
+    initialize_wandb(
+        project="Modulus-Launch",
+        entity="Modulus",
+        name="Vortex_Shedding-Training",
+        group="Vortex_Shedding-DDP-Group",
+        mode=cfg.wandb_mode,
+    )
+
+    logger = PythonLogger("main")
+    rank_zero_logger = RankZeroLoggingWrapper(logger, dist)
+    rank_zero_logger.file_logging()
+
+    trainer = MGNTrainer(cfg, rank_zero_logger)
+
+    for epoch in tqdm(
+        range(trainer.epoch_init, cfg.epochs),
+        desc="Epochs",
+        disable=dist.rank != 0,
+    ):
+        epoch_loss = 0.0
+        num_batches = 0
+
+        dataloader_tqdm = tqdm(
+            trainer.dataloader,
+            desc=f"Epoch {epoch}",
+            leave=False,
+            disable=dist.rank != 0,
+        )
+
+        for batch in dataloader_tqdm:
+            loss, loss_dict = trainer.train(batch)
+
+            batch_loss = loss.detach().item()
+            epoch_loss += batch_loss
+            num_batches += 1
+
+            if torch.cuda.is_available():
+                mem_alloc = torch.cuda.memory_allocated() / 1024**3
+                mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            else:
+                mem_alloc = 0.0
+                mem_reserved = 0.0
+
+            dataloader_tqdm.set_postfix(
+                loss=f"{batch_loss:.4e}",
+                gpu_mem=f"{mem_alloc:.2f}/{mem_reserved:.2f} GB",
+            )
+
+        avg_loss = epoch_loss / num_batches
+        rank_zero_logger.info(f"Epoch {epoch} | Avg Loss: {avg_loss:.4e}")
+
+        if dist.rank == 0:
+            save_checkpoint(
+                to_absolute_path(cfg.ckpt_path),
+                models=trainer.model,
+                optimizer=trainer.optimizer,
+                scheduler=trainer.scheduler,
+                scaler=trainer.scaler,
+                epoch=epoch,
+            )
+
+
+if __name__ == "__main__":
+    main()
